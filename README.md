@@ -1,5 +1,8 @@
 # Novel Character Simulator
 
+English:
+README_EN.md
+
 一个通用的小说角色模拟器与小说世界模拟器。
 
 本项目旨在将任意小说文本自动转换为可运行的角色与世界数据，用于角色扮演、世界模拟、多 Agent 推演、RAG 检索以及 AI NPC 构建。
