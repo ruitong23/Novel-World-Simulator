@@ -719,6 +719,158 @@ def build_canonical_novel_db(world_graph, normalized, legacy_world_db=None):
         )
     )
 
+    scene_rows = defaultdict(
+        lambda: {
+            "order_key": None,
+            "participants": {},
+            "locations": {},
+            "artifacts": {},
+            "abilities": {},
+            "relations": [],
+            "evidence_refs": [],
+        }
+    )
+
+    def add_scene_name(row, bucket, entity_id, name):
+        if entity_id and name:
+            row[bucket][entity_id] = name
+
+    def add_scene_evidence(row, order, source_text="", relation_summary="", tags=None):
+        row["order_key"] = order
+        source_text = clean_text(source_text)
+        relation_summary = clean_text(relation_summary)
+        if not source_text and not relation_summary:
+            return
+        row["evidence_refs"].append(
+            {
+                "source_chunk_id": order,
+                "source_text": source_text,
+                "relation_summary": relation_summary,
+                "tags": unique(tags or [])[:12],
+            }
+        )
+
+    for relation in relation_rows:
+        try:
+            order = int(
+                relation.get("order_key")
+                if relation.get("order_key") is not None
+                else relation.get("first_seen_order")
+            )
+        except (TypeError, ValueError):
+            continue
+        row = scene_rows[order]
+        for side in ("source", "target"):
+            entity_type = relation.get(f"{side}_entity_type")
+            entity_id = relation.get(f"{side}_entity_id")
+            name = relation.get(f"{side}_name")
+            if entity_type == "Character":
+                add_scene_name(row, "participants", entity_id, name)
+            elif entity_type == "Location":
+                add_scene_name(row, "locations", entity_id, name)
+            elif entity_type == "Artifact":
+                add_scene_name(row, "artifacts", entity_id, name)
+            elif entity_type == "Ability":
+                add_scene_name(row, "abilities", entity_id, name)
+        row["relations"].append(
+            {
+                "relation_id": relation.get("relation_id"),
+                "relation_type": relation.get("relation_type"),
+                "source_name": relation.get("source_name"),
+                "target_name": relation.get("target_name"),
+            }
+        )
+        for evidence in relation.get("evidence_refs", [])[:3]:
+            add_scene_evidence(
+                row,
+                order,
+                evidence.get("source_text"),
+                evidence.get("relation_summary"),
+                [
+                    relation.get("relation_type", ""),
+                    relation.get("source_name", ""),
+                    relation.get("target_name", ""),
+                ],
+            )
+
+    for entity in world_graph.get("entities", []):
+        if entity.get("entity_type") not in {"Location", "Artifact", "Ability"}:
+            continue
+        order = min_order(entity)
+        if order is None:
+            continue
+        row = scene_rows[order]
+        bucket = {
+            "Location": "locations",
+            "Artifact": "artifacts",
+            "Ability": "abilities",
+        }[entity.get("entity_type")]
+        add_scene_name(row, bucket, entity["entity_id"], entity.get("canonical_name", ""))
+        for evidence in evidence_refs(entity)[:2]:
+            add_scene_evidence(
+                row,
+                order,
+                evidence.get("source_text"),
+                evidence.get("relation_summary", ""),
+                [entity.get("entity_type"), entity.get("canonical_name", "")],
+            )
+
+    scene_beats = []
+    for order, row in sorted(scene_rows.items()):
+        evidence = unique(row["evidence_refs"])[:8]
+        if not evidence and not row["relations"]:
+            continue
+        summary_parts = []
+        if row["participants"]:
+            summary_parts.append("人物：" + "、".join(row["participants"].values()))
+        if row["locations"]:
+            summary_parts.append("地点：" + "、".join(row["locations"].values()))
+        if row["artifacts"]:
+            summary_parts.append("物品：" + "、".join(row["artifacts"].values()))
+        if row["abilities"]:
+            summary_parts.append("能力：" + "、".join(row["abilities"].values()))
+        evidence_text = "；".join(
+            clean_text(item.get("relation_summary"))
+            or clean_text(item.get("source_text"))
+            for item in evidence[:3]
+            if clean_text(item.get("relation_summary"))
+            or clean_text(item.get("source_text"))
+        )
+        if evidence_text:
+            summary_parts.append(evidence_text)
+        if not summary_parts:
+            continue
+        scene_beats.append(
+            {
+                "scene_beat_id": f"scene_beat_{order}",
+                "canonical_name": f"剧情片段 {order}",
+                "order_key": order,
+                "participants": [
+                    {"entity_id": key, "name": value, "role": "present_or_related"}
+                    for key, value in row["participants"].items()
+                ],
+                "locations": [
+                    {"entity_id": key, "name": value}
+                    for key, value in row["locations"].items()
+                ],
+                "artifacts": [
+                    {"entity_id": key, "name": value}
+                    for key, value in row["artifacts"].items()
+                ],
+                "abilities": [
+                    {"entity_id": key, "name": value}
+                    for key, value in row["abilities"].items()
+                ],
+                "summary": "；".join(summary_parts)[:900],
+                "relation_refs": unique(row["relations"])[:16],
+                "source_chunk_ids": [str(order)],
+                "evidence_refs": evidence,
+                "confidence": "scene_beat_from_skeleton_evidence",
+                "runtime_use": "rag_and_narrative_pressure",
+                "not_a_hard_canonical_event": True,
+            }
+        )
+
     canonical_db = {
         "schema_version": LAYER_SCHEMA_VERSION,
         "layer": "Canonical Novel DB",
@@ -740,6 +892,7 @@ def build_canonical_novel_db(world_graph, normalized, legacy_world_db=None):
         "character_growth_lines": character_growth_lines,
         "relationship_development_lines": relationship_development_lines,
         "event_chain": event_chain,
+        "scene_beats": scene_beats,
         "item_flow": item_flow,
         "ability_unlock_paths": ability_unlock_paths,
         "organization_changes": organization_changes,
@@ -760,6 +913,7 @@ def build_canonical_novel_db(world_graph, normalized, legacy_world_db=None):
                 item.get("access_type") == "open" for item in resources
             ),
             "event_chain_count": len(event_chain),
+            "scene_beat_count": len(scene_beats),
             "relationship_line_count": len(relationship_development_lines),
             "organization_change_count": len(organization_changes),
             "relation_type_counts": dict(Counter(item["type"] for item in relations)),
@@ -1114,8 +1268,9 @@ def relationship_dimensions(relation_type, evidence_kind=""):
         "visibility": 0,
     }
     relation_type = str(relation_type or "")
-    if relation_type.startswith("CO_") or evidence_kind in {
-        "same_scene",
+    if relation_type == "CO_OCCURS_IN_SCENE" or evidence_kind == "same_scene":
+        dims.update({"visibility": 1})
+    elif relation_type.startswith("CO_") or evidence_kind in {
         "shared_event",
         "shared_location",
         "shared_artifact",
@@ -1174,6 +1329,56 @@ def build_canonical_component_dbs(canonical_db, world_db=None):
         }
         for event_id in ordered_event_ids
     ]
+    scene_beat_records = {
+        item["scene_beat_id"]: item
+        for item in canonical_db.get("scene_beats", [])
+        if item.get("scene_beat_id")
+    }
+    event_orders = {
+        events_by_id[event_id].get("canonical_order")
+        for event_id in ordered_event_ids
+        if event_id in events_by_id
+    }
+    prepared_orders = {
+        item.get("order_key")
+        for item in scene_beat_records.values()
+        if item.get("order_key") is not None
+    }
+    sparse_threshold = max(8, min(60, len(prepared_orders) // 2))
+    if len(timeline_nodes) < sparse_threshold:
+        for scene_beat_id, beat in sorted(
+            scene_beat_records.items(),
+            key=lambda item: (item[1].get("order_key", 10**12), item[0]),
+        ):
+            if beat.get("order_key") in event_orders:
+                continue
+            timeline_nodes.append(
+                {
+                    "timeline_node_id": "timeline_" + scene_beat_id,
+                    "canonical_order": beat.get("order_key"),
+                    "event_id": scene_beat_id,
+                    "event_ref": {
+                        "db": "canonical_scene_beat_db",
+                        "scene_beat_id": scene_beat_id,
+                    },
+                    "branchable": True,
+                    "can_be_blocked": True,
+                    "can_be_altered": True,
+                    "node_kind": "scene_beat",
+                    "confidence": beat.get("confidence"),
+                    "not_a_hard_canonical_event": True,
+                    "state_change_refs": {},
+                }
+            )
+        timeline_nodes.sort(
+            key=lambda item: (
+                item.get("canonical_order") is None,
+                item.get("canonical_order")
+                if item.get("canonical_order") is not None
+                else 10**12,
+                item.get("timeline_node_id", ""),
+            )
+        )
 
     canonical_relationship_source = world_db.get("canonical_relationship_db") or world_db.get(
         "canonical_relationships_db", {}
@@ -1314,6 +1519,33 @@ def build_canonical_component_dbs(canonical_db, world_db=None):
                 "canonical_event_can_be_blocked": True,
                 "blocked_events_do_not_apply_state_changes": True,
                 "alternative_hooks_enable_branching": True,
+            },
+        },
+        "canonical_scene_beat_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Scene Beat DB",
+            "purpose": (
+                "Low-confidence skeleton-derived scene beats for RAG and "
+                "narrative pressure; not hard canonical events."
+            ),
+            "scene_beats": scene_beat_records,
+            "scene_beat_order": [
+                item["scene_beat_id"]
+                for item in sorted(
+                    scene_beat_records.values(),
+                    key=lambda beat: (
+                        beat.get("order_key") is None,
+                        beat.get("order_key")
+                        if beat.get("order_key") is not None
+                        else 10**12,
+                        beat.get("scene_beat_id", ""),
+                    ),
+                )
+            ],
+            "policy": {
+                "scene_beats_are_not_hard_events": True,
+                "use_for_retrieval_and_pacing": True,
+                "must_not_override_committed_runtime_state": True,
             },
         },
         "canonical_character_db": {
@@ -1766,6 +1998,7 @@ def write_world_state_layer_files(base_dir, world_db):
         "canonical_novel_db.json": world_db.get("canonical_novel_db", {}),
         "canonical_timeline_db.json": world_db.get("canonical_timeline_db", {}),
         "canonical_event_db.json": world_db.get("canonical_event_db", {}),
+        "canonical_scene_beat_db.json": world_db.get("canonical_scene_beat_db", {}),
         "canonical_character_db.json": world_db.get("canonical_character_db", {}),
         "canonical_relationship_db.json": world_db.get("canonical_relationship_db", {}),
         "canonical_ability_db.json": world_db.get("canonical_ability_db", {}),
@@ -1802,6 +2035,7 @@ def load_layer_sidecars(world_db, base_dir):
         "canonical_novel_db": "canonical_novel_db.json",
         "canonical_timeline_db": "canonical_timeline_db.json",
         "canonical_event_db": "canonical_event_db.json",
+        "canonical_scene_beat_db": "canonical_scene_beat_db.json",
         "canonical_character_db": "canonical_character_db.json",
         "canonical_relationship_db": "canonical_relationship_db.json",
         "canonical_ability_db": "canonical_ability_db.json",

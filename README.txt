@@ -17,6 +17,7 @@ Quick start:
 
 Official generated databases are written under:
 
-generated_db/world/
-generated_db/characters/
-generated_db/agents/
+db/graph/
+db/canonical/
+db/runtime/
+db/agents/

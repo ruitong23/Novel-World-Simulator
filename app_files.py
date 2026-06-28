@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = APP_DIR / "settings.json"
-GENERATED_DB_DIR = APP_DIR / "generated_db"
+GENERATED_DB_DIR = APP_DIR / "db"
 GRAPH_DB_DIR = GENERATED_DB_DIR / "graph"
 CANONICAL_DB_DIR = GENERATED_DB_DIR / "canonical"
 AGENT_DB_DIR = GENERATED_DB_DIR / "agents"
@@ -28,44 +28,46 @@ def generated_db_path(group, filename):
     raise ValueError(f"Unknown generated DB group: {group}")
 
 PREPARATION_OUTPUTS = [
-    ("generated_db/graph/novel_ontology.json", "Ontology used by graph extraction"),
-    ("generated_db/graph/raw_graph_triples.json", "Validated graph triples for selected chunks"),
-    ("generated_db/graph/mention_weak_relations.json", "Mention-level weak relation evidence"),
-    ("generated_db/canonical/mention_alias_index.json", "Mention and alias index"),
-    ("generated_db/canonical/canonical_entities.json", "Resolved canonical entities"),
-    ("generated_db/graph/normalized_graph_triples.json", "Normalized graph"),
-    ("generated_db/canonical/canonical_relationship_db.json", "Canonical relationship database"),
-    ("generated_db/canonical/relationship_arc_db.json", "Relationship arc database"),
-    ("generated_db/graph/structured_world_graph.json", "Structured world graph"),
-    ("generated_db/canonical/character_state_db.json", "Character state database"),
-    ("generated_db/canonical/world_db.json", "Canonical world aggregate"),
-    ("generated_db/canonical/canonical_timeline_db.json", "Canonical baseline timeline"),
-    ("generated_db/canonical/canonical_event_db.json", "Canonical event database"),
-    ("generated_db/canonical/canonical_character_db.json", "Canonical character template database"),
-    ("generated_db/canonical/canonical_ability_db.json", "Canonical ability database"),
-    ("generated_db/canonical/canonical_item_db.json", "Canonical item database"),
-    ("generated_db/canonical/canonical_organization_db.json", "Canonical organization database"),
-    ("generated_db/canonical/canonical_location_db.json", "Canonical location database"),
-    ("generated_db/canonical/canonical_world_rule_db.json", "Canonical world-rule database"),
-    ("generated_db/canonical/canonical_knowledge_db.json", "Canonical knowledge database"),
-    ("generated_db/runtime/simulation_state_template.json", "Cutoff-based initial state template"),
-    ("generated_db/runtime/runtime_event_db.json", "Runtime event queue database"),
-    ("generated_db/runtime/runtime_relationship_db.json", "Runtime relationship database"),
-    ("generated_db/runtime/runtime_log.json", "Runtime event-sourcing log"),
-    ("generated_db/agents/agent_profiles.json", "Canonical agent profile templates"),
-    ("generated_db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
+    ("db/graph/novel_ontology.json", "Ontology used by graph extraction"),
+    ("db/graph/raw_graph_triples.json", "Single-pass skeleton graph triples for selected chunks"),
+    ("db/graph/mention_weak_relations.json", "Mention-level weak relation evidence"),
+    ("db/canonical/mention_alias_index.json", "Mention and alias index"),
+    ("db/canonical/canonical_entities.json", "Resolved canonical entities"),
+    ("db/graph/normalized_graph_triples.json", "Normalized graph"),
+    ("db/canonical/canonical_relationship_db.json", "Canonical relationship database"),
+    ("db/canonical/relationship_arc_db.json", "Relationship arc database"),
+    ("db/graph/structured_world_graph.json", "Structured world graph aggregated from skeleton evidence"),
+    ("db/canonical/character_state_db.json", "Character state database"),
+    ("db/canonical/world_db.json", "Canonical world aggregate"),
+    ("db/canonical/canonical_timeline_db.json", "Canonical baseline timeline"),
+    ("db/canonical/canonical_event_db.json", "Canonical event database"),
+    ("db/canonical/canonical_scene_beat_db.json", "Skeleton scene-beat database for RAG and pacing"),
+    ("db/canonical/canonical_character_db.json", "Canonical character template database"),
+    ("db/canonical/canonical_relationships_db.json", "Canonical relationship evidence database"),
+    ("db/canonical/canonical_ability_db.json", "Canonical ability database"),
+    ("db/canonical/canonical_item_db.json", "Canonical item database"),
+    ("db/canonical/canonical_organization_db.json", "Canonical organization database"),
+    ("db/canonical/canonical_location_db.json", "Canonical location database"),
+    ("db/canonical/canonical_world_rule_db.json", "Canonical world-rule database"),
+    ("db/canonical/canonical_knowledge_db.json", "Canonical knowledge database"),
+    ("db/runtime/simulation_state_template.json", "Cutoff-based initial state template"),
+    ("db/runtime/runtime_event_db.json", "Runtime event queue database"),
+    ("db/runtime/runtime_relationship_db.json", "Runtime relationship database"),
+    ("db/runtime/runtime_log.json", "Runtime event-sourcing log"),
+    ("db/agents/agent_profiles.json", "Canonical agent profile templates"),
+    ("db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
 ]
 
 SIMULATION_REQUIRED_FILES = [
-    ("generated_db/canonical/world_db.json", "Canonical world aggregate"),
-    ("generated_db/canonical/canonical_timeline_db.json", "Canonical baseline timeline"),
-    ("generated_db/canonical/canonical_event_db.json", "Canonical event database"),
-    ("generated_db/runtime/simulation_state_template.json", "Cutoff-based initial state template"),
-    ("generated_db/runtime/runtime_event_db.json", "Runtime event queue database"),
-    ("generated_db/runtime/runtime_relationship_db.json", "Runtime relationship database"),
-    ("generated_db/canonical/canonical_character_db.json", "Canonical character template database"),
-    ("generated_db/agents/agent_profiles.json", "Canonical agent profile templates"),
-    ("generated_db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
+    ("db/canonical/world_db.json", "Canonical world aggregate"),
+    ("db/canonical/canonical_timeline_db.json", "Canonical baseline timeline"),
+    ("db/canonical/canonical_event_db.json", "Canonical event database"),
+    ("db/runtime/simulation_state_template.json", "Cutoff-based initial state template"),
+    ("db/runtime/runtime_event_db.json", "Runtime event queue database"),
+    ("db/runtime/runtime_relationship_db.json", "Runtime relationship database"),
+    ("db/canonical/canonical_character_db.json", "Canonical character template database"),
+    ("db/agents/agent_profiles.json", "Canonical agent profile templates"),
+    ("db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
     ("step17_runtime.py", "Step 17 simulation engine"),
 ]
 

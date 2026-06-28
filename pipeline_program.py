@@ -19,12 +19,12 @@ def _parse_arguments():
     parser = argparse.ArgumentParser(description="Prepare a novel simulation.")
     parser.add_argument("--novel", required=True, help="Path to the source novel TXT file.")
     parser.add_argument("--percent", type=float, default=100.0)
-    parser.add_argument("--chunk-size", type=int, default=2000)
+    parser.add_argument("--chunk-size", type=int, default=3000)
     parser.add_argument("--overlap", type=int, default=300)
     parser.add_argument(
         "--chunk-limit",
         type=int,
-        default=30,
+        default=10,
         help="Maximum Step 9 chunks to process. Use 0 for all selected chunks.",
     )
     return parser.parse_args()
@@ -1450,7 +1450,8 @@ for item in novel_ontology["edge_types"]:
 
 # %% Notebook cell 21
 # Step 9 configuration
-# The first 20 chunks are a complete integration scope, not an incomplete full-book run.
+# Skeleton mode: each chunk gets exactly one unified LLM pass. Step 9 only
+# emits compact graph evidence for later ER, aggregation, and retrieval.
 
 from pathlib import Path
 
@@ -1460,12 +1461,12 @@ STEP9_CHUNK_START = 0
 STEP9_CHUNK_LIMIT = ARGS.chunk_limit if ARGS.chunk_limit else None
 STEP9_MAX_NEW_CHUNKS = None
 STEP9_REPROCESS_CHUNK_IDS = set()
-STEP9_VALIDATION_RETRIES = 2
+STEP9_VALIDATION_RETRIES = 0
 STEP9_MAX_TOKENS = 4096
-STEP9_WORLD_VALIDATION_RETRIES = 1
-STEP9_WORLD_MAX_TOKENS = 3072
-STEP9_AUTHORITY_VALIDATION_RETRIES = 1
-STEP9_AUTHORITY_MAX_TOKENS = 2048
+STEP9_NODE_LIMIT = 24
+STEP9_EDGE_LIMIT = 36
+STEP9_DESCRIPTION_LIMIT = 20
+STEP9_RELATION_SUMMARY_LIMIT = 20
 STEP9_RESET_LEGACY_OUTPUT = True
 STEP9_FORCE_REBUILD = False
 
@@ -1496,7 +1497,11 @@ import re
 import unicodedata
 
 
-STEP9_SCHEMA_VERSION = "4.1"
+STEP9_SCHEMA_VERSION = "5.1-skeleton"
+STEP9_SKELETON_ENTITY_TYPES = {
+    "Character", "TitleOrIdentity", "Location", "Artifact",
+    "Ability", "Event", "Organization", "WorldRule",
+}
 
 
 def stable_json_hash(value):
@@ -1525,6 +1530,13 @@ def clean_graph_text(value):
     text = unicodedata.normalize("NFKC", str(value))
     text = "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch)[0] != "C")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def truncate_graph_label(value, limit):
+    text = clean_graph_text(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip("，,。；;：:、- ")
 
 
 def normalized_evidence_text(value):
@@ -1576,17 +1588,30 @@ def build_step9_constraints(ontology):
 
 def build_step9_prompt(chunk_id, chunk_text, ontology):
     entity_types, optional_fields, edge_types = build_step9_constraints(ontology)
+    skeleton_entity_types = {
+        "Character", "TitleOrIdentity", "Location", "Artifact",
+        "Ability", "Event", "Organization", "WorldRule",
+    }
+    allowed_entity_types = sorted(skeleton_entity_types & set(entity_types))
     compact_rules = {
         edge_type: {
             "source_types": sorted(rule["source_types"]),
             "target_types": sorted(rule["target_types"]),
         }
         for edge_type, rule in edge_types.items()
+        if (
+            not rule["source_types"]
+            or rule["source_types"] & skeleton_entity_types
+        )
+        and (
+            not rule["target_types"]
+            or rule["target_types"] & skeleton_entity_types
+        )
     }
     optional_field_rules = {
         entity_type: sorted(fields)
         for entity_type, fields in optional_fields.items()
-        if fields
+        if entity_type in skeleton_entity_types and fields
     }
 
     language_rule = language_output_instruction(
@@ -1596,7 +1621,7 @@ def build_step9_prompt(chunk_id, chunk_text, ontology):
 chunk_id: {chunk_id}
 
 Allowed entity types:
-{json.dumps(sorted(entity_types), ensure_ascii=False)}
+{json.dumps(allowed_entity_types, ensure_ascii=False)}
 
 Allowed optional attributes by entity type:
 {json.dumps(optional_field_rules, ensure_ascii=False, indent=2)}
@@ -1611,7 +1636,7 @@ Return exactly one JSON object with this shape:
       "node_ref": "n1",
       "type": "Character",
       "surface_name": "原文称呼",
-      "description": "只基于当前 chunk 的局部说明",
+      "description": "12-20字短标签",
       "source_text": "当前 chunk 中的原文短句",
       "attributes": {{}}
     }}
@@ -1622,40 +1647,45 @@ Return exactly one JSON object with this shape:
       "type": "HAS_ALIAS",
       "source_node": "n1",
       "target_node": "n2",
-      "relation_summary": "只基于当前 chunk 的关系说明",
+      "relation_summary": "12-20字短关系",
       "source_text": "当前 chunk 中的原文短句",
       "address_term": "仅 ADDRESSES_AS 使用：原文称呼词"
     }}
   ],
-  "uncertain": [
-    {{"text": "原文短句", "reason": "不能可靠确定的原因"}}
-  ]
+  "uncertain": []
 }}
 
 Rules:
 0. {language_rule}
-1. Only extract facts explicitly supported by this chunk.
-2. Do not summarize the story and do not build character profiles.
-3. Do not perform entity resolution. Preserve every surface_name as written.
-4. A title, alias, role, disguise, or transformation form is TitleOrIdentity
-   unless it is acting as an independent character in this chunk.
-5. Every node and edge must contain an exact source_text excerpt from this chunk.
-6. Every edge endpoint must reference a node_ref in the same response.
-7. Do not create self-loop edges.
-8. Use HAS_ALIAS only for stable alternative names of the same continuing entity. Use HAS_TITLE for current ranks, offices, honorifics, and formal titles. Use HAS_FORMER_IDENTITY for an explicitly past identity, office, or form; set the TitleOrIdentity node identity_subtype=former_identity. Every TitleOrIdentity node must be connected by an identity edge, and that edge's exact source_text must contain both the owner and identity surface. Do not infer identity continuity without direct textual support.
-9. Use TRANSFORMS_INTO only for explicit transformation, disguise, or revealed form.
-10. Put unsupported or ambiguous claims in uncertain, not edges.
-11. Every node must set attributes.mention_kind to one of: named_entity, generic_role, collective, temporary_identity, descriptive_reference. Proper names and stable unique identifiers are named_entity. Group labels are collective. Unnamed occupations, relationship labels, social positions, demographic descriptions, and other non-unique references are generic_role or descriptive_reference. A disguise, temporary appearance, avatar, or form label is temporary_identity and normally uses TitleOrIdentity, not Character.
-12. HAS_ALIAS/HAS_TITLE describe identity naming owned by the source. They must never encode who spoke a vocative. When A addresses B with a role, title, nickname, or relationship term, use ADDRESSES_AS with A as source and the actual addressee B as target; store the spoken term in address_term.
-13. Use REVEALED_AS when one temporary persona or appearance is explicitly revealed as one true Character. If several distinct characters jointly create or perform a shared disguise, do not connect the same persona to every character with REVEALED_AS; use IMPERSONATES from each known character to the shared temporary-identity node when the text supports collective participation. Use IMPERSONATES for disguise or copied appearance, and TRANSFORMS_INTO only for a continuing entity's own form change.
-14. Prefer the most precise relationship edge supported by the text. Use the ontology's teaching, family, identity-continuity, command, protection, travel, affiliation, conflict, and interaction relations according to their definitions. Do not collapse a precise relation into HAS_RELATIONSHIP, which is a last resort.
-15. FIGHTS_WITH requires the two endpoints themselves to engage in direct combat. Harming a member, employee, dependent, representative, or subordinate does not create a FIGHTS_WITH edge to that entity's leader or organization. Use OPPOSES/OFFENDS only when the text explicitly supports that broader conflict; otherwise omit the edge.
-16. ADDRESSES_AS must point from the speaker to the actual addressee Character, never to a title node. Put the literal spoken term in address_term. A role, honorific, relationship term, joke, or temporary label is not an alias merely because it was spoken.
-17. Relation direction follows the ontology semantics: instructor -> learner for MASTER_OF; learner -> instructor for DISCIPLE_OF; parent -> child for PARENT_OF; child -> parent for CHILD_OF; leader -> member for LEADS; accompanying character -> accompanied character for ACCOMPANIES; protector -> protected entity for PROTECTS; speaker -> actual addressee for ADDRESSES_AS.
-18. Forms, disguises, temporary appearances, generic roles, and address terms are not aliases. Use TRANSFORMS_INTO or IMPERSONATES for forms and ADDRESSES_AS for spoken terms.
-19. Keep this character-and-identity pass compact: at most 24 nodes and 36 edges. Prioritize named characters, identity links, precise relationships, locations, abilities, artifacts, goals, constraints, and knowledge needed by later simulation steps. A separate Step 9 sub-pass handles dense world-model facts.
-20. Copy source_text verbatim. Do not repair, translate, paraphrase, shorten it with ellipses, or join non-contiguous excerpts.
-21. Output JSON only.
+1. Single-pass skeleton extraction only. Read this chunk once and return compact graph evidence.
+2. Only extract facts explicitly supported by this chunk.
+3. Do not summarize the story, analyze motives, or build character profiles.
+4. Do not write long descriptions. description must be at most 20 Chinese characters or 20 short words.
+5. relation_summary must be at most 20 Chinese characters or 20 short words.
+6. uncertain must always be [].
+7. Every node and edge must help later Entity Resolution, Character State, World DB, or Retrieval Tags.
+8. Prioritize named characters, aliases/titles/forms, explicit relationships, locations, organizations, artifacts, abilities, bounded events, and general world rules.
+9. Omit decorative background, repeated exposition, generic crowds, unsupported emotions, and facts with no later retrieval or aggregation value.
+10. Every node and edge must contain an exact source_text excerpt from this chunk.
+11. source_text must be a short contiguous original sentence or phrase. Do not paraphrase, translate, repair, join excerpts, or use ellipses.
+12. Do not perform entity resolution. Preserve every surface_name as written.
+13. A title, alias, role, disguise, or transformation form is TitleOrIdentity unless it is acting as an independent character in this chunk.
+14. Every edge endpoint must reference a node_ref in the same response.
+15. Do not create self-loop edges.
+16. Keep output small: at most {STEP9_NODE_LIMIT} nodes and {STEP9_EDGE_LIMIT} edges.
+17. Prefer fewer high-value facts over exhaustive extraction.
+18. Output JSON only.
+
+Identity and relation rules:
+19. Use HAS_ALIAS only for stable alternative names of the same continuing entity. Use HAS_TITLE for current ranks, offices, honorifics, and formal titles. Use HAS_FORMER_IDENTITY for an explicitly past identity, office, or form; set the TitleOrIdentity node identity_subtype=former_identity. Every TitleOrIdentity node must be connected by an identity edge, and that edge's exact source_text must contain both the owner and identity surface. Do not infer identity continuity without direct textual support.
+20. Use TRANSFORMS_INTO only for explicit transformation, disguise, or revealed form.
+21. Every node must set attributes.mention_kind to one of: named_entity, generic_role, collective, temporary_identity, descriptive_reference. Proper names and stable unique identifiers are named_entity. Group labels are collective. Unnamed occupations, relationship labels, social positions, demographic descriptions, and other non-unique references are generic_role or descriptive_reference. A disguise, temporary appearance, avatar, or form label is temporary_identity and normally uses TitleOrIdentity, not Character.
+22. HAS_ALIAS/HAS_TITLE describe identity naming owned by the source. They must never encode who spoke a vocative. When A addresses B with a role, title, nickname, or relationship term, use ADDRESSES_AS with A as source and the actual addressee B as target; store the spoken term in address_term.
+23. Use REVEALED_AS when one temporary persona or appearance is explicitly revealed as one true Character. If several distinct characters jointly create or perform a shared disguise, use IMPERSONATES from each known character to the shared temporary-identity node when the text supports collective participation. Use IMPERSONATES for disguise or copied appearance, and TRANSFORMS_INTO only for a continuing entity's own form change.
+24. Prefer the most precise relationship edge supported by the text. HAS_RELATIONSHIP is a last resort.
+25. FIGHTS_WITH requires the two endpoints themselves to engage in direct combat. Harming a member, employee, dependent, representative, or subordinate does not create a FIGHTS_WITH edge to that entity's leader or organization.
+26. Relation direction follows the ontology semantics: instructor -> learner for MASTER_OF; learner -> instructor for DISCIPLE_OF; parent -> child for PARENT_OF; child -> parent for CHILD_OF; leader -> member for LEADS; accompanying character -> accompanied character for ACCOMPANIES; protector -> protected entity for PROTECTS; speaker -> actual addressee for ADDRESSES_AS.
+27. WorldRule is only for repeatable mechanisms, explicit constraints, institutions, or generally applicable causal rules. A one-time action is Event.
 
 Current chunk:
 {chunk_text}
@@ -1663,10 +1693,11 @@ Current chunk:
 
 
 STEP9_SYSTEM_PROMPT = """
-You are a graph extraction component for a novel simulation pipeline.
-Extract ontology-constrained local graph facts from exactly one chunk.
+You are a skeleton graph extraction component for a novel simulation pipeline.
+Extract compact, evidence-bound graph facts from exactly one chunk.
 Return JSON only. Never use knowledge outside the supplied chunk.
 Do not resolve aliases into canonical entities.
+Do not write profiles, summaries, analysis, or uncertain claims.
 Generated text must follow the source novel's language and dominant script.
 """.strip()
 
@@ -1931,9 +1962,10 @@ def normalize_step9_payload(payload, chunk, chunk_index, ontology):
 
     raw_nodes = payload.get("nodes", [])
     raw_edges = payload.get("edges", [])
-    raw_uncertain = payload.get("uncertain", [])
     if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
         raise ValueError("nodes and edges must be JSON arrays.")
+    raw_nodes = raw_nodes[:STEP9_NODE_LIMIT]
+    raw_edges = raw_edges[:STEP9_EDGE_LIMIT]
 
     for position, raw_node in enumerate(raw_nodes, start=1):
         if not isinstance(raw_node, dict):
@@ -1944,10 +1976,15 @@ def normalize_step9_payload(payload, chunk, chunk_index, ontology):
         node_type = clean_graph_text(raw_node.get("type"))
         surface_name = clean_graph_text(raw_node.get("surface_name"))
         source_text = clean_graph_text(raw_node.get("source_text"))
-        description = clean_graph_text(raw_node.get("description"))
+        description = truncate_graph_label(
+            raw_node.get("description"), STEP9_DESCRIPTION_LIMIT
+        )
 
         if not node_ref or node_ref in node_ref_to_node:
             errors.append(f"node {position}: missing or duplicate node_ref")
+            continue
+        if node_type not in STEP9_SKELETON_ENTITY_TYPES:
+            errors.append(f"node {node_ref}: type {node_type!r} is outside skeleton mode")
             continue
         if node_type not in entity_types:
             errors.append(f"node {node_ref}: disallowed type {node_type!r}")
@@ -2026,7 +2063,9 @@ def normalize_step9_payload(payload, chunk, chunk_index, ontology):
         source_ref = clean_graph_text(raw_edge.get("source_node"))
         target_ref = clean_graph_text(raw_edge.get("target_node"))
         source_text = clean_graph_text(raw_edge.get("source_text"))
-        relation_summary = clean_graph_text(raw_edge.get("relation_summary"))
+        relation_summary = truncate_graph_label(
+            raw_edge.get("relation_summary"), STEP9_RELATION_SUMMARY_LIMIT
+        )
 
         if edge_type not in edge_types:
             errors.append(f"edge {edge_ref}: disallowed type {edge_type!r}")
@@ -2126,14 +2165,6 @@ def normalize_step9_payload(payload, chunk, chunk_index, ontology):
         })
 
     uncertain = []
-    if isinstance(raw_uncertain, list):
-        for item in raw_uncertain:
-            if not isinstance(item, dict):
-                continue
-            text = clean_graph_text(item.get("text"))
-            reason = clean_graph_text(item.get("reason"))
-            if text and normalized_evidence_text(text) in evidence_haystack:
-                uncertain.append({"text": text, "reason": reason})
 
     result = {
         "chunk_id": chunk_id,
@@ -2149,8 +2180,11 @@ def normalize_step9_payload(payload, chunk, chunk_index, ontology):
             "node_count": len(nodes),
             "input_edge_count": len(raw_edges),
             "edge_count": len(edges),
-            "uncertain_count": len(uncertain),
+            "uncertain_count": 0,
             "warning_count": len(warnings),
+            "skeleton_mode": True,
+            "node_limit": STEP9_NODE_LIMIT,
+            "edge_limit": STEP9_EDGE_LIMIT,
         },
         "validation_warnings": warnings,
     }
@@ -2346,6 +2380,15 @@ def extract_step9_pass(
             result, errors = normalize_step9_payload(
                 payload, chunk, chunk_index, ontology
             )
+            if errors and (result.get("nodes") or result.get("edges")):
+                result.setdefault("validation_warnings", []).extend(
+                    "dropped invalid skeleton item: " + item
+                    for item in errors
+                )
+                result.setdefault("validation_summary", {})[
+                    "dropped_invalid_item_count"
+                ] = len(errors)
+                errors = []
             score = (len(result["nodes"]) + 2 * len(result["edges"]), -len(errors))
             if best_score is None or score > best_score:
                 best_result = result
@@ -2378,33 +2421,8 @@ def extract_graph_from_chunk(chunk, chunk_index, ontology):
         chunk, chunk_index, ontology, prompt, STEP9_SYSTEM_PROMPT,
         STEP9_MAX_TOKENS, STEP9_VALIDATION_RETRIES,
     )
-    if len(clean_graph_text(get_chunk_text(chunk))) < 80:
-        return primary
-    world_prompt = build_step9_world_prompt(
-        get_chunk_id(chunk, chunk_index), get_chunk_text(chunk), ontology
-    )
-    world = extract_step9_pass(
-        chunk, chunk_index, ontology, world_prompt, STEP9_WORLD_SYSTEM_PROMPT,
-        STEP9_WORLD_MAX_TOKENS, STEP9_WORLD_VALIDATION_RETRIES, ref_prefix="w_",
-    )
-    merged = merge_step9_results(primary, world)
-    # Authority is sparse and easy to miss in a general extraction. This
-    # compact sub-pass runs once for each substantive chunk and may correctly
-    # return empty arrays; semantic filtering keeps only structured results.
-    authority_prompt = build_step9_authority_prompt(
-        get_chunk_id(chunk, chunk_index), get_chunk_text(chunk),
-        merged, ontology,
-    )
-    authority = extract_step9_pass(
-        chunk, chunk_index, ontology, authority_prompt,
-        STEP9_AUTHORITY_SYSTEM_PROMPT, STEP9_AUTHORITY_MAX_TOKENS,
-        STEP9_AUTHORITY_VALIDATION_RETRIES, ref_prefix="a_",
-    )
-    authority = filter_step9_authority_result(authority, merged)
-    merged = merge_step9_results(
-        merged, authority, secondary_label="authority-pass"
-    )
-    return merged
+    primary["extraction_mode"] = "single_pass_skeleton"
+    return primary
 
 
 def step9_chunk_manifest(chunks):
@@ -2480,7 +2498,10 @@ def load_or_create_step9_state(chunks, ontology):
     existing = json.loads(STEP9_OUTPUT_PATH.read_text(encoding="utf-8"))
     if not isinstance(existing, dict) or existing.get("schema_version") != STEP9_SCHEMA_VERSION:
         if STEP9_RESET_LEGACY_OUTPUT:
-            print("Legacy Step 9 output detected; rebuilding it with schema v2.")
+            print(
+                "Incompatible Step 9 output detected; rebuilding it with "
+                f"{STEP9_SCHEMA_VERSION}."
+            )
             return expected
         raise ValueError("Legacy raw_graph_triples.json detected. Enable STEP9_RESET_LEGACY_OUTPUT.")
 
@@ -2667,7 +2688,10 @@ from relationship_state_layers import (
     build_relationship_arc_db,
     normalize_weak_relations,
 )
-from db_output_layout import publish_generated_databases
+from db_output_layout import (
+    cleanup_root_database_files,
+    publish_generated_databases,
+)
 
 
 STEP10_SCHEMA_VERSION = "4.0"
@@ -2681,7 +2705,9 @@ def normalize_surface_name(value):
 def load_step9_graph_for_downstream(path, allow_incomplete=False):
     graph = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(graph, dict) or graph.get("schema_version") != STEP9_SCHEMA_VERSION:
-        raise ValueError("Step 10 requires Step 9 schema v2 raw_graph_triples.json.")
+        raise ValueError(
+            f"Step 10 requires Step 9 {STEP9_SCHEMA_VERSION} raw_graph_triples.json."
+        )
     if not allow_incomplete and not graph.get("complete"):
         raise ValueError(
             "Step 9 output is incomplete. Finish Step 9 or explicitly enable sample mode."
@@ -3955,6 +3981,12 @@ def classify_entity_names(group_node_ids, mentions):
                 and context.get("role") == "target"
                 for context in contexts
             )
+            or any(
+                context.get("edge_type") == "TRANSFORMS_INTO"
+                and context.get("role") == "source"
+                and context.get("other_type") == "Character"
+                for context in contexts
+            )
             or (
                 kind == "temporary_identity"
                 and any(
@@ -4500,6 +4532,7 @@ def build_canonical_output(
             for name in name_buckets["stable_names"]
             if name != canonical_name
         ]
+        stable_surface_names = sorted(set([canonical_name] + aliases))
         for bucket_name in (
             "titles", "forms", "temporary_identities",
             "generic_references", "address_terms",
@@ -4513,6 +4546,7 @@ def build_canonical_output(
             "entity_type": entity_type,
             "canonical_name": canonical_name,
             "surface_names": surface_names,
+            "stable_surface_names": stable_surface_names,
             "aliases": aliases,
             "titles": name_buckets["titles"],
             "forms": name_buckets["forms"],
@@ -5137,6 +5171,9 @@ def build_normalized_graph(
                     "target_surface_name": edge["source_surface_name"],
                 })
                 collective_reveal_rewrites.append(normalized_edge)
+                if normalized_edge["source_entity_id"] == normalized_edge["target_entity_id"]:
+                    removed_self_loops.append(normalized_edge)
+                    continue
                 edges.append(normalized_edge)
                 continue
 
@@ -5412,6 +5449,7 @@ def build_structured_world_graph(normalized, canonical):
     relations = []
     outgoing = defaultdict(list)
     incoming = defaultdict(list)
+    removed_self_loops = []
     for (edge_type, source_id, target_id), mentions in sorted(edge_groups.items()):
         relation_id = "relation_" + hashlib.sha1(
             f"{edge_type}|{source_id}|{target_id}".encode("utf-8")
@@ -5433,6 +5471,15 @@ def build_structured_world_graph(normalized, canonical):
             ],
             ("source_chunk_id", "source_text", "relation_summary"),
         )
+        if source_id == target_id:
+            removed_self_loops.append({
+                "type": edge_type,
+                "source_entity_id": source_id,
+                "target_entity_id": target_id,
+                "mention_count": len(mentions),
+                "evidence": evidence,
+            })
+            continue
         relation = {
             "relation_id": relation_id,
             "type": edge_type,
@@ -5455,6 +5502,10 @@ def build_structured_world_graph(normalized, canonical):
         "identity_facts": normalized.get("identity_facts", []),
         "entities": entities,
         "relations": relations,
+        "validation": {
+            "removed_self_loop_count": len(removed_self_loops),
+            "removed_self_loops": removed_self_loops,
+        },
         "adjacency": {
             entity["entity_id"]: {
                 "outgoing_relation_ids": sorted(outgoing[entity["entity_id"]]),
@@ -5568,6 +5619,10 @@ def relation_view(relation, entity_by_id, character_id):
         "entity_type": other["entity_type"],
         "name": other["canonical_name"],
         "surface_names": other["surface_names"],
+        "stable_surface_names": other.get(
+            "stable_surface_names",
+            other.get("surface_names", []),
+        ),
         "evidence": relation["evidence"],
     }
 
@@ -5682,6 +5737,13 @@ def build_character_state_db(world_graph, normalized):
             "reference_id": entity["entity_id"],
             "display_name": entity["canonical_name"],
             "surface_names": entity.get("surface_names", []),
+            "stable_surface_names": entity.get(
+                "stable_surface_names",
+                [
+                    entity["canonical_name"],
+                    *entity.get("aliases", []),
+                ],
+            ),
             "reference_kind": entity.get("reference_kind", ""),
             "review_status": entity.get("review_status", "context_only"),
             "context_count": entity.get("context_count", 0),
@@ -5790,14 +5852,6 @@ def build_character_state_db(world_graph, normalized):
             for item in entity.get("evidence", [])
         })
         form_names = set(entity.get("forms", []))
-        stable_named_surfaces = {
-            item.get("surface_name", "")
-            for item in mention_records[character_id]
-            if item.get("attributes", {}).get("mention_kind")
-            == "named_entity"
-        }
-        promoted_form_aliases = form_names & stable_named_surfaces
-        form_names -= promoted_form_aliases
         temporary_identity_names = set(
             entity.get("temporary_identities", [])
         )
@@ -5845,10 +5899,7 @@ def build_character_state_db(world_graph, normalized):
         )
         clean_aliases = list(dict.fromkeys([
             alias
-            for alias in [
-                *entity.get("aliases", []),
-                *sorted(promoted_form_aliases),
-            ]
+            for alias in entity.get("aliases", [])
             if alias not in forbidden_aliases
         ]))
 
@@ -5869,6 +5920,13 @@ def build_character_state_db(world_graph, normalized):
             "generic_references": sorted(generic_reference_names),
             "address_terms": sorted(address_terms),
             "surface_names": entity.get("surface_names", []),
+            "stable_surface_names": entity.get(
+                "stable_surface_names",
+                [
+                    entity["canonical_name"],
+                    *entity.get("aliases", []),
+                ],
+            ),
             "simulation_status": status,
             "agent_eligible": agent_eligible,
             "background": background,
@@ -6572,6 +6630,11 @@ def step15_build_concept_registry(
         runtime_candidates = [
             item for item in candidates if item["runtime_eligible"]
         ]
+        default_reference_types = {"canonical", "alias", "title"}
+        default_runtime_candidates = [
+            item for item in runtime_candidates
+            if item["reference_type"] in default_reference_types
+        ]
         intent_routes = {}
         for intent in sorted({
             intent for item in runtime_candidates
@@ -6588,17 +6651,23 @@ def step15_build_concept_registry(
         runtime_ids = list(dict.fromkeys(
             item["concept_id"] for item in runtime_candidates
         ))
+        default_runtime_ids = list(dict.fromkeys(
+            item["concept_id"] for item in default_runtime_candidates
+        ))
+        default_ids = default_runtime_ids or runtime_ids
         registry[surface] = {
             "surface": surface,
             "candidates": candidates,
             "intent_routes": intent_routes,
-            "default_concept_id": runtime_ids[0] if len(runtime_ids) == 1 else None,
-            "requires_intent": len(runtime_ids) > 1,
+            "default_concept_id": (
+                default_ids[0] if len(default_ids) == 1 else None
+            ),
+            "requires_intent": len(default_ids) > 1,
             "resolution_policy": (
                 "use_default"
-                if len(runtime_ids) == 1
+                if len(default_ids) == 1
                 else "require_query_intent_or_graph_context"
-                if runtime_ids
+                if default_ids
                 else "retrieve_source_then_runtime_resolve"
             ),
         }
@@ -7712,7 +7781,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-STEP16_SCHEMA_VERSION = "3.1"
+STEP16_SCHEMA_VERSION = "3.2-skeleton-retrieval"
 STEP16_CHARACTER_DB_PATH = Path("character_state_db.json")
 STEP16_WORLD_DB_PATH = Path("world_db.json")
 STEP16_OUTPUT_PATH = Path("agent_profiles.json")
@@ -7765,6 +7834,64 @@ def step16_unique(values):
         seen.add(marker)
         result.append(value)
     return result
+
+
+def step16_collect_source_chunk_refs(profile):
+    chunk_ids = []
+    snippet_by_chunk = defaultdict(list)
+
+    def add_ref(chunk_id, source_text=""):
+        if chunk_id in (None, ""):
+            return
+        text = clean_graph_text(source_text)
+        marker = str(chunk_id)
+        chunk_ids.append(marker)
+        if text:
+            snippet_by_chunk[marker].append(text)
+
+    for item in profile.get("evidence_refs", []):
+        add_ref(item.get("source_chunk_id"), item.get("source_text"))
+    for relation in profile.get("relationships", []):
+        for item in relation.get("evidence", []):
+            add_ref(item.get("source_chunk_id"), item.get("source_text"))
+    for memory in profile.get("memories", []):
+        for chunk_id in memory.get("source_chunk_ids", []):
+            add_ref(chunk_id, memory.get("source_text"))
+    for ref in profile.get("world_context", {}).get("knowledge_refs", []):
+        for chunk_id in ref.get("source_chunk_ids", []):
+            add_ref(chunk_id, "; ".join(ref.get("descriptions", [])))
+
+    ordered_chunk_ids = step16_unique(chunk_ids)
+    profile["source_chunk_refs"] = ordered_chunk_ids
+    profile["source_evidence_refs"] = [
+        {
+            "source_chunk_id": chunk_id,
+            "snippets": step16_unique(snippets)[:5],
+        }
+        for chunk_id, snippets in sorted(
+            snippet_by_chunk.items(),
+            key=lambda item: (
+                int(item[0]) if str(item[0]).isdigit() else 10**9,
+                str(item[0]),
+            ),
+        )
+    ]
+    return profile
+
+
+def step16_event_refs(profile):
+    refs = []
+    for memory in profile.get("memories", []):
+        refs.append({
+            "event_ref_id": memory.get("timeline_id") or memory.get("relation_id"),
+            "event_type": memory.get("relation_type", ""),
+            "summary": clean_graph_text(
+                memory.get("relation_summary")
+                or memory.get("source_text")
+            ),
+            "source_chunk_ids": memory.get("source_chunk_ids", []),
+        })
+    return step16_unique(refs)
 
 
 def step16_relation_confidence(relation, canonical_character_ids):
@@ -8287,17 +8414,52 @@ def build_step16_profile(character, world_db, canonical_ids):
             "contradicted_claims_require_correction": True,
         },
     }
+    ability_tags = [
+        item.get("name") or item.get("canonical_name") or item.get("surface_name")
+        for item in profile.get("capabilities", {}).get("abilities", [])
+    ]
+    item_tags = [
+        item.get("name") or item.get("canonical_name") or item.get("surface_name")
+        for group_name in ("owned_items", "used_items")
+        for item in profile.get("capabilities", {}).get(group_name, [])
+    ]
+    profile["event_refs"] = step16_event_refs(profile)
     profile["retrieval_tags"] = sorted(set([
         *identity["canonical_identity_names"],
         *identity["titles"],
         *identity["forms"],
         *identity["temporary_identities"],
+        *[item for item in ability_tags if item],
+        *[item for item in item_tags if item],
         *(item["name"] for item in relations),
         *(
             item["name"]
             for item in world_context["knowledge_refs"]
         ),
+        *(
+            item["summary"]
+            for item in profile["event_refs"]
+            if item.get("summary")
+        ),
     ]))
+    profile = step16_collect_source_chunk_refs(profile)
+    profile["needs_runtime_retrieval"] = True
+    profile["runtime_retrieval"] = {
+        "enabled": True,
+        "strategy": "hybrid_terms_graph_source_refs",
+        "top_k_source_snippets": 3,
+        "query_sources": [
+            "retrieval_tags",
+            "source_chunk_refs",
+            "event_refs",
+            "current_scene",
+            "player_input",
+        ],
+        "long_detail_policy": (
+            "Do not store long original-setting prose in the profile; "
+            "retrieve source snippets on demand at runtime."
+        ),
+    }
     project_language = world_db.get(
         "project_language",
         get_project_language_profile(),
@@ -8356,6 +8518,18 @@ reference_only = [
             "minimum_new_direct_evidence": 2,
             "allow_unsupported_generation": False,
         },
+        "retrieval_tags": step16_unique([
+            character["canonical_name"],
+            *character.get("aliases", []),
+            *character.get("titles", []),
+            *character.get("form_names", []),
+        ]),
+        "source_chunk_refs": [
+            str(chunk_id)
+            for chunk_id in character.get("source_chunk_ids", [])
+        ],
+        "event_refs": [],
+        "needs_runtime_retrieval": True,
     }
     for character in characters
     if not character.get("agent_eligible")
@@ -8494,11 +8668,16 @@ runtime_agent_state_db = write_runtime_agent_state_file(
 project_data["agent_profiles_path"] = str(STEP16_OUTPUT_PATH)
 project_data["runtime_agent_state_path"] = "runtime_agent_state.json"
 published_databases = publish_generated_databases(Path("."))
+removed_root_database_files = cleanup_root_database_files(
+    Path("."),
+    published_databases,
+)
 project_data["generated_db_paths"] = published_databases
 
 print("Step 16 output:", STEP16_OUTPUT_PATH)
-print("Generated DB folder:", Path("generated_db").resolve())
+print("Generated DB folder:", Path("db").resolve())
 print("Generated DB files:", len(published_databases))
+print("Cleaned root DB files:", len(removed_root_database_files))
 print("runtime agent states:", len(runtime_agent_state_db.get("agent_states", {})))
 print("identity LLM calls: 0")
 print("agents:", agent_profile_db["agent_count"])

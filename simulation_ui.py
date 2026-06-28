@@ -59,6 +59,7 @@ class SimulationApp:
         self.events = queue.Queue()
         self.operation_started = None
         self.selected_character_id = None
+        self.start_percent = tk.DoubleVar(value=0.0)
 
         saved = load_settings()
         self.base_url = os.getenv("NOVEL_LLM_BASE_URL", saved["llm_base_url"])
@@ -104,8 +105,9 @@ class SimulationApp:
 
         self._build_ui()
         self._refresh_agent_list()
+        self._restore_active_character()
         self._refresh_runtime_status()
-        self._show_latest_story()
+        self._show_latest_story(prefer_recovery=True)
         self.root.after(100, self._drain_events)
 
     def _build_ui(self):
@@ -142,10 +144,21 @@ class SimulationApp:
 
         self.agent_detail = tk.Text(left, width=35, height=13, wrap="word", state="disabled")
         self.agent_detail.grid(row=2, column=0, columnspan=2, pady=(8, 6), sticky="ew")
+        start_scope = ttk.Frame(left)
+        start_scope.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        start_scope.columnconfigure(1, weight=1)
+        ttk.Label(start_scope, text="Start %").grid(row=0, column=0, sticky="w")
+        ttk.Scale(
+            start_scope,
+            from_=0,
+            to=100,
+            variable=self.start_percent,
+        ).grid(row=0, column=1, padx=6, sticky="ew")
+        ttk.Label(start_scope, text="0 = auto").grid(row=0, column=2, sticky="e")
         self.enter_button = ttk.Button(
             left, text="Enter world as this character", command=self.enter_world
         )
-        self.enter_button.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.enter_button.grid(row=4, column=0, columnspan=2, sticky="ew")
 
         right = ttk.Frame(outer)
         right.grid(row=1, column=1, sticky="nsew")
@@ -169,8 +182,12 @@ class SimulationApp:
         ttk.Label(runtime_frame, textvariable=self.eta_text).grid(
             row=2, column=1, sticky="e", padx=8
         )
+        self.save_button = ttk.Button(
+            runtime_frame, text="Save", command=self.save_world
+        )
+        self.save_button.grid(row=1, column=2, padx=(8, 0))
         ttk.Button(runtime_frame, text="Reset world", command=self.reset_world).grid(
-            row=1, column=2, rowspan=2, padx=(8, 0)
+            row=2, column=2, padx=(8, 0)
         )
         ttk.Progressbar(
             runtime_frame,
@@ -180,6 +197,11 @@ class SimulationApp:
         ttk.Label(runtime_frame, textvariable=self.story_progress_text).grid(
             row=4, column=0, columnspan=3, sticky="w"
         )
+        ttk.Button(
+            runtime_frame,
+            text="Preview DB anchor",
+            command=self.preview_db_anchor,
+        ).grid(row=5, column=2, padx=(8, 0), pady=(6, 0), sticky="e")
 
         notebook = ttk.Notebook(right)
         notebook.grid(row=1, column=0, pady=(8, 0), sticky="nsew")
@@ -241,6 +263,17 @@ class SimulationApp:
             )
             self.list_ids.append(item["character_id"])
 
+    def _restore_active_character(self):
+        scene = self.store.runtime.get("active_scene") or {}
+        character_id = scene.get("focus_character_id")
+        if not character_id or character_id not in self.list_ids:
+            return
+        index = self.list_ids.index(character_id)
+        self.agent_list.selection_clear(0, "end")
+        self.agent_list.selection_set(index)
+        self.agent_list.see(index)
+        self._select_agent()
+
     def _select_agent(self, _event=None):
         selection = self.agent_list.curselection()
         if not selection:
@@ -295,6 +328,7 @@ class SimulationApp:
         self.eta_text.set("ETA: calculating")
         self.enter_button.configure(state="disabled")
         self.continue_button.configure(state="disabled")
+        self.save_button.configure(state="disabled")
 
         def worker():
             try:
@@ -313,6 +347,11 @@ class SimulationApp:
             "Creating the opening scene...",
             lambda: self.orchestrator.start_character_experience(
                 self.selected_character_id,
+                progress_percent=(
+                    float(self.start_percent.get())
+                    if float(self.start_percent.get()) > 0
+                    else None
+                ),
                 progress_callback=self._progress_callback,
             ),
         )
@@ -332,6 +371,483 @@ class SimulationApp:
                 text, progress_callback=self._progress_callback
             ),
         )
+
+    def save_world(self):
+        if not self.store.runtime.get("active_scene"):
+            messagebox.showwarning(
+                "No active scene",
+                "Choose a character and enter the world before saving.",
+            )
+            return
+        self._run_operation(
+            "Preparing manual save...",
+            lambda: {
+                "manual_save": self.orchestrator.create_manual_save(
+                    progress_callback=self._progress_callback
+                )
+            },
+        )
+
+    def _db_anchor_packet(self):
+        story_progress = self._story_progress_snapshot()
+        runtime = self.store.runtime
+        timeline = (
+            runtime.get("canonical_timeline")
+            or self.orchestrator.canonical_timeline
+            or self.runtime["world_db"]
+            .get("canonical_timeline_db", {})
+            .get("timeline_nodes", [])
+        )
+        scene = runtime.get("active_scene") or {}
+        focus_id = scene.get("focus_character_id") or self.selected_character_id
+        if timeline and not runtime.get("active_scene") and self.start_percent.get() > 0:
+            cursor = round((len(timeline) - 1) * float(self.start_percent.get()) / 100)
+        elif timeline and not runtime.get("active_scene") and focus_id:
+            try:
+                cursor, _anchor = self.orchestrator._opening_anchor(focus_id)
+            except Exception:
+                cursor = int(runtime.get("timeline_cursor", 0) or 0)
+        else:
+            cursor = int(runtime.get("timeline_cursor", 0) or 0)
+        cursor = max(0, min(cursor, max(0, len(timeline) - 1)))
+        current = timeline[cursor] if timeline else {}
+        nearby = timeline[max(0, cursor - 2): cursor + 3] if timeline else []
+        focus_name = self.character_by_id.get(focus_id, {}).get(
+            "canonical_name", "No active character"
+        )
+        character_packet = self._character_preview_packet(
+            focus_id,
+            cursor,
+            timeline,
+        )
+        return {
+            "focus_character": focus_name,
+            "focus_character_id": focus_id,
+            "focus_character_packet": character_packet,
+            "selected_start_percent": float(self.start_percent.get()),
+            "preview_cursor": cursor,
+            "active_scene": scene,
+            "story_progress": story_progress,
+            "current_canonical_anchor": current,
+            "nearby_canonical_anchors": nearby,
+            "recent_branch_records": runtime.get("branch_records", [])[-5:],
+            "recent_runtime_events": [
+                {
+                    "event_type": item.get("event_type"),
+                    "narration": item.get("narration", "")[:500],
+                    "revision_after": item.get("revision_after"),
+                }
+                for item in self.store.branch.get("events", [])[-5:]
+            ],
+        }
+
+    def _character_preview_packet(self, character_id, cursor, timeline):
+        if not character_id:
+            return {}
+        character = self.character_by_id.get(character_id, {})
+        try:
+            profile = self.orchestrator._dynamic_profile(character_id)
+        except Exception:
+            profile = {}
+        world_db = self.runtime["world_db"]
+        canonical_db = world_db.get("canonical_novel_db", {})
+        entity_track = canonical_db.get("entity_tracks", {}).get(character_id, {})
+        names = {
+            character.get("canonical_name", ""),
+            entity_track.get("canonical_name", ""),
+            profile.get("canonical_name", ""),
+            *character.get("aliases", []),
+            *character.get("forms", []),
+            *entity_track.get("aliases", []),
+            *entity_track.get("forms", []),
+            *profile.get("identity", {}).get("aliases", []),
+            *profile.get("identity", {}).get("forms", []),
+        }
+        names = {item for item in names if item}
+        source_orders = set()
+        for value in (
+            character.get("first_seen_order"),
+            entity_track.get("first_seen_order"),
+            profile.get("first_seen_order"),
+        ):
+            if str(value).isdigit():
+                source_orders.add(int(value))
+        for source in (
+            character.get("source_chunk_ids", []),
+            entity_track.get("source_chunk_ids", []),
+            profile.get("source_chunk_refs", []),
+        ):
+            for value in source:
+                if str(value).isdigit():
+                    source_orders.add(int(value))
+        for evidence in [
+            *character.get("evidence_refs", []),
+            *entity_track.get("evidence_refs", []),
+            *profile.get("evidence_refs", []),
+        ]:
+            value = evidence.get("source_chunk_id")
+            if str(value).isdigit():
+                source_orders.add(int(value))
+        if timeline and not source_orders and 0 <= cursor < len(timeline):
+            for value in timeline[cursor].get("source_chunk_ids", []):
+                if str(value).isdigit():
+                    source_orders.add(int(value))
+
+        relationship_lines = []
+        for relation in canonical_db.get("relationship_development_lines", []):
+            if character_id in {
+                relation.get("source_entity_id"),
+                relation.get("target_entity_id"),
+            }:
+                relationship_lines.append(relation)
+
+        scene_beat_hits = []
+        for beat in self.orchestrator.canonical_timeline:
+            text = json.dumps(beat, ensure_ascii=False)
+            if character_id in text or any(name and name in text for name in names):
+                scene_beat_hits.append(beat)
+                continue
+            beat_orders = {
+                int(value)
+                for value in beat.get("source_chunk_ids", [])
+                if str(value).isdigit()
+            }
+            if beat_orders & source_orders:
+                scene_beat_hits.append(beat)
+
+        raw_contexts = self._raw_chunk_preview_context(names, source_orders)
+        raw_text = json.dumps(raw_contexts, ensure_ascii=False)
+        related_names = set()
+        evidence_digest = {
+            "identity_or_forms": [],
+            "locations": [],
+            "abilities": [],
+            "items": [],
+            "relationship_or_conflict_lines": [],
+            "nearby_event_lines": [],
+            "raw_focus_descriptions": [],
+        }
+        focus_names = {name for name in names if name}
+        for chunk in raw_contexts:
+            for node in chunk.get("nodes", []):
+                node_name = node.get("surface_name")
+                node_type = node.get("type")
+                description = node.get("description")
+                if node_name:
+                    related_names.add(node_name)
+                node_line = "：".join(
+                    part for part in (node_name, description) if part
+                )
+                if not node_line:
+                    continue
+                if node_name in focus_names or any(
+                    name and name in node_line for name in focus_names
+                ):
+                    evidence_digest["raw_focus_descriptions"].append(node_line)
+                if node_type in {"TitleOrIdentity", "Identity", "Form"}:
+                    evidence_digest["identity_or_forms"].append(node_line)
+                elif node_type == "Location":
+                    evidence_digest["locations"].append(node_line)
+                elif node_type == "Ability":
+                    evidence_digest["abilities"].append(node_line)
+                elif node_type in {"Artifact", "Item", "Weapon"}:
+                    evidence_digest["items"].append(node_line)
+            for edge in chunk.get("edges", []):
+                if edge.get("source_surface_name"):
+                    related_names.add(edge["source_surface_name"])
+                if edge.get("target_surface_name"):
+                    related_names.add(edge["target_surface_name"])
+                summary = edge.get("relation_summary") or edge.get("summary")
+                if summary:
+                    evidence_digest["nearby_event_lines"].append(summary)
+                edge_text = json.dumps(edge, ensure_ascii=False)
+                if summary and any(
+                    name and name in edge_text for name in focus_names
+                ):
+                    evidence_digest["relationship_or_conflict_lines"].append(
+                        summary
+                    )
+        for beat in scene_beat_hits:
+            beat_line = beat.get("summary") or beat.get("event")
+            if beat_line:
+                evidence_digest["nearby_event_lines"].append(beat_line)
+        for key, values in list(evidence_digest.items()):
+            deduped = []
+            seen = set()
+            for value in values:
+                if value and value not in seen:
+                    deduped.append(value)
+                    seen.add(value)
+                if len(deduped) >= 12:
+                    break
+            evidence_digest[key] = deduped
+
+        return {
+            "character_name": character.get("canonical_name")
+            or entity_track.get("canonical_name")
+            or profile.get("canonical_name"),
+            "character": {
+                "character_id": character_id,
+                "canonical_name": character.get("canonical_name")
+                or entity_track.get("canonical_name")
+                or profile.get("canonical_name"),
+                "aliases": character.get("aliases", []),
+                "titles": character.get("titles", []),
+                "forms": character.get("forms", [])
+                or entity_track.get("forms", []),
+                "first_seen_order": character.get("first_seen_order")
+                or entity_track.get("first_seen_order"),
+                "description": character.get("background_summary")
+                or "；".join(entity_track.get("descriptions", [])),
+                "attributes": entity_track.get("attributes", {}),
+                "profile_tier": profile.get("profile_tier", "reference"),
+                "runtime_mode": profile.get("runtime_mode", "dynamic_reference_agent"),
+            },
+            "capabilities": profile.get("capabilities", {}),
+            "relationships": profile.get("relationships", [])[:16],
+            "canonical_relationship_lines": relationship_lines[:16],
+            "related_scene_beats": scene_beat_hits[:12],
+            "raw_chunk_contexts": raw_contexts[:6],
+            "evidence_digest": evidence_digest,
+            "related_surface_names": sorted(related_names)[:40],
+            "evidence_gaps": {
+                "has_prebuilt_agent_profile": bool(
+                    character_id in self.orchestrator.agent_by_character_id
+                ),
+                "has_direct_relationship_lines": bool(relationship_lines),
+                "has_raw_chunk_context": bool(raw_contexts),
+                "raw_context_mentions_focus": any(
+                    name and name in raw_text for name in names
+                ),
+            },
+            "preview_policy": {
+                "prefer_character_centered_summary": True,
+                "state_uncertainty_when_db_is_sparse": True,
+                "do_not_use_external_story_knowledge": True,
+                "include_playable_opening_hooks": True,
+            },
+        }
+
+    def _raw_chunk_preview_context(self, names, source_orders):
+        graph_path = generated_db_path("graph", "raw_graph_triples.json")
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        target_orders = set(source_orders)
+        for order in list(source_orders):
+            target_orders.update({order - 1, order, order + 1})
+        contexts = []
+        for chunk in graph.get("results", []):
+            chunk_id = chunk.get("chunk_id")
+            try:
+                chunk_order = int(chunk_id)
+            except (TypeError, ValueError):
+                chunk_order = None
+            text = json.dumps(chunk, ensure_ascii=False)
+            if chunk_order not in target_orders and not any(
+                name and name in text for name in names
+            ):
+                continue
+            nodes = [
+                node
+                for node in chunk.get("nodes", [])
+                if any(name and name in json.dumps(node, ensure_ascii=False) for name in names)
+                or chunk_order in source_orders
+            ][:16]
+            edges = [
+                edge
+                for edge in chunk.get("edges", [])
+                if any(name and name in json.dumps(edge, ensure_ascii=False) for name in names)
+                or chunk_order in source_orders
+            ][:24]
+            if not nodes and not edges:
+                continue
+            contexts.append(
+                {
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk.get("chunk_index"),
+                    "nodes": nodes,
+                    "edges": edges,
+                    "validation_status": chunk.get("validation_status"),
+                }
+            )
+            if len(contexts) >= 8:
+                break
+        return contexts
+
+    def _compact_db_anchor_packet_for_llm(self, payload):
+        character_packet = payload.get("focus_character_packet") or {}
+
+        def compact_anchor(anchor):
+            if not anchor:
+                return {}
+            return {
+                "scheduled_order": anchor.get("scheduled_order"),
+                "event": anchor.get("event"),
+                "summary": anchor.get("summary"),
+                "location_id": anchor.get("location_id"),
+                "participant_ids": anchor.get("participant_ids", [])[:8],
+                "source_chunk_ids": anchor.get("source_chunk_ids", [])[:8],
+                "confidence": anchor.get("confidence"),
+            }
+
+        def compact_relation(relation):
+            return {
+                "source": relation.get("source_entity_name")
+                or relation.get("source_surface_name")
+                or relation.get("source_entity_id"),
+                "target": relation.get("target_entity_name")
+                or relation.get("target_surface_name")
+                or relation.get("target_entity_id"),
+                "type": relation.get("relation_type") or relation.get("type"),
+                "summary": relation.get("summary")
+                or relation.get("relation_summary"),
+            }
+
+        return {
+            "focus_character": payload.get("focus_character"),
+            "selected_start_percent": payload.get("selected_start_percent"),
+            "preview_cursor": payload.get("preview_cursor"),
+            "story_progress": payload.get("story_progress"),
+            "current_anchor": compact_anchor(
+                payload.get("current_canonical_anchor")
+            ),
+            "nearby_anchors": [
+                compact_anchor(anchor)
+                for anchor in payload.get("nearby_canonical_anchors", [])[:5]
+            ],
+            "character": character_packet.get("character", {}),
+            "character_evidence_digest": character_packet.get(
+                "evidence_digest", {}
+            ),
+            "canonical_relationship_lines": [
+                compact_relation(relation)
+                for relation in character_packet.get(
+                    "canonical_relationship_lines", []
+                )[:8]
+            ],
+            "related_scene_beats": [
+                compact_anchor(anchor)
+                for anchor in character_packet.get("related_scene_beats", [])[:8]
+            ],
+            "related_surface_names": character_packet.get(
+                "related_surface_names", []
+            )[:30],
+            "evidence_gaps": character_packet.get("evidence_gaps", {}),
+            "recent_branch_records": payload.get("recent_branch_records", []),
+            "recent_runtime_events": payload.get("recent_runtime_events", []),
+        }
+
+    def _render_db_anchor_preview_material(self, material):
+        character = material.get("character") or {}
+        digest = material.get("character_evidence_digest") or {}
+        current = material.get("current_anchor") or {}
+        gaps = material.get("evidence_gaps") or {}
+        lines = [
+            f"焦点角色：{material.get('focus_character') or 'DB 暂无'}",
+            f"当前剧情锚点：{current.get('event') or 'DB 暂无'}",
+            f"锚点顺序：{current.get('scheduled_order') or 'DB 暂无'}",
+            f"角色身份描述：{character.get('description') or 'DB 暂无'}",
+            f"首次出场顺序：{character.get('first_seen_order') or 'DB 暂无'}",
+            "身份/别名/形态证据："
+            + "；".join(digest.get("identity_or_forms") or ["DB 暂无"]),
+            "地点证据：" + "；".join(digest.get("locations") or ["DB 暂无"]),
+            "能力证据：" + "；".join(digest.get("abilities") or ["DB 暂无"]),
+            "物品证据：" + "；".join(digest.get("items") or ["DB 暂无"]),
+            "关系/冲突证据："
+            + "；".join(
+                digest.get("relationship_or_conflict_lines") or ["DB 暂无"]
+            ),
+            "附近事件证据："
+            + "；".join(digest.get("nearby_event_lines") or ["DB 暂无"]),
+            "角色原始描述："
+            + "；".join(digest.get("raw_focus_descriptions") or ["DB 暂无"]),
+            "相关表面名："
+            + "；".join(material.get("related_surface_names") or ["DB 暂无"]),
+        ]
+        gap_lines = []
+        if not gaps.get("has_prebuilt_agent_profile"):
+            gap_lines.append("没有预制角色画像，需要运行时用原文片段补充性格、口吻和行动习惯")
+        if not gaps.get("has_direct_relationship_lines"):
+            gap_lines.append("没有直接关系线，需要从附近事件推断与唐僧师徒的冲突关系")
+        if not gaps.get("has_raw_chunk_context"):
+            gap_lines.append("没有原始片段上下文，需要回查原文")
+        if not gap_lines:
+            gap_lines.append("暂无明显缺口")
+        lines.append("资料缺口：" + "；".join(gap_lines))
+        related_beats = []
+        for beat in material.get("related_scene_beats", [])[:5]:
+            beat_line = beat.get("summary") or beat.get("event")
+            if beat_line:
+                related_beats.append(beat_line)
+        if related_beats:
+            lines.append("相关剧情片段：" + "；".join(related_beats))
+        return "\n".join(lines)
+
+    def preview_db_anchor(self):
+        payload = self._db_anchor_packet()
+        preview_material = self._compact_db_anchor_packet_for_llm(payload)
+        preview_material_text = self._render_db_anchor_preview_material(
+            preview_material
+        )
+        self.progress_text.set("Summarizing DB anchor...")
+
+        def worker():
+            try:
+                summary = self.orchestrator._call_text(
+                    (
+                        "你是给玩家看的小说剧情预览撰稿人，不是技术顾问。"
+                        "只根据给出的事实清单写角色开局预览，不使用外部知识。"
+                        "你的目标是帮助玩家判断：这个角色此刻是谁、处在什么剧情附近、"
+                        "有什么能力/关系/前因后果，以及适合从哪里开局。"
+                        "禁止写技术方案、代码、schema、pipeline、API、节点、边、字段、ID、表格。"
+                        "证据不足时写“资料暂缺”，不要编造。"
+                        "你的第一行必须直接是“角色名 - 剧情阶段”，不要写"
+                        "“根据提供的信息/数据”等开场白。"
+                    ),
+                    (
+                        "请只根据下面的事实清单写预览，不要提到事实清单、"
+                        "技术系统或内部结构。\n\n"
+                        "输出格式：\n"
+                        "角色名 - 当前剧情阶段\n"
+                        "2到4句话可玩定位。\n\n"
+                        "【已知信息】\n"
+                        "- 身份/别名/形态：...\n"
+                        "- 目标或动机：...\n"
+                        "- 地点：...\n"
+                        "- 人物关系：...\n\n"
+                        "【能力与限制】\n"
+                        "- 能力：...\n"
+                        "- 物品：...\n"
+                        "- 弱点或限制：...\n\n"
+                        "【前因后果】\n"
+                        "...\n\n"
+                        "【开局切入点】\n"
+                        "1. ...\n2. ...\n3. ...\n\n"
+                        "【资料缺口】\n"
+                        "- ...\n\n"
+                        "事实清单：\n"
+                        f"{preview_material_text}"
+                    ),
+                    temperature=0.2,
+                    max_tokens=1600,
+                )
+                self.events.put(
+                    (
+                        "preview",
+                        {
+                            "title": "DB anchor preview",
+                            "text": summary
+                            + "\n\n--- DB anchor packet ---\n"
+                            + json.dumps(payload, ensure_ascii=False, indent=2),
+                        },
+                    )
+                )
+            except Exception as error:
+                self.events.put(("operation_error", error))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reset_world(self):
         if not messagebox.askyesno(
@@ -357,7 +873,32 @@ class SimulationApp:
             in {"scene_opening_rendered", "immersive_scene_turn"}
         ]
 
-    def _show_latest_story(self):
+    def _show_latest_story(self, prefer_recovery=False):
+        if prefer_recovery:
+            recovery = self.store.runtime.get("recovery_snapshot") or {}
+            if recovery.get("summary"):
+                nearby = recovery.get("nearby_state", {})
+                names = [
+                    item.get("name")
+                    for item in nearby.get("characters", [])
+                    if item.get("name")
+                ]
+                clock = nearby.get("clock", {})
+                minute = int(clock.get("minute_of_day", 480))
+                text = "\n\n".join(
+                    [
+                        "上次存档回顾",
+                        recovery.get("summary", ""),
+                        (
+                            f"当前位置：{nearby.get('location_name', '当前位置')}；"
+                            f"附近人物：{'、'.join(names) or '暂无明确记录'}；"
+                            f"时间：第 {clock.get('day', 1)} 天 "
+                            f"{minute // 60:02d}:{minute % 60:02d}"
+                        ),
+                    ]
+                )
+                self._set_text(self.story, text)
+                return
         events = self._story_events()
         text = events[-1].get("narration", "") if events else ""
         if text:
@@ -416,6 +957,7 @@ class SimulationApp:
         runtime = self.store.runtime
         timeline = (
             runtime.get("canonical_timeline")
+            or self.orchestrator.canonical_timeline
             or self.runtime["world_db"]
             .get("canonical_timeline_db", {})
             .get("timeline_nodes", [])
@@ -494,8 +1036,13 @@ class SimulationApp:
                 elif event == "operation_done":
                     self.enter_button.configure(state="normal")
                     self.continue_button.configure(state="normal")
+                    self.save_button.configure(state="normal")
                     self.progress_value.set(100)
-                    self.progress_text.set("Turn complete")
+                    self.progress_text.set(
+                        "Save complete"
+                        if "manual_save" in payload
+                        else "Turn complete"
+                    )
                     self.eta_text.set("ETA: complete")
                     self.user_input.delete("1.0", "end")
                     self._show_latest_story()
@@ -508,12 +1055,36 @@ class SimulationApp:
                 elif event == "operation_error":
                     self.enter_button.configure(state="normal")
                     self.continue_button.configure(state="normal")
+                    self.save_button.configure(state="normal")
                     self.progress_text.set("Operation failed")
                     self.eta_text.set("ETA: stopped")
                     messagebox.showerror("Simulation error", str(payload))
+                elif event == "preview":
+                    self.progress_text.set("Preview ready")
+                    self.eta_text.set("ETA: --")
+                    self._show_text_window(payload["title"], payload["text"])
         except queue.Empty:
             pass
         self.root.after(100, self._drain_events)
+
+    def _show_text_window(self, title, text):
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("780x640")
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        output = tk.Text(frame, wrap="word")
+        scroll = ttk.Scrollbar(frame, command=output.yview)
+        output.configure(yscrollcommand=scroll.set)
+        output.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        output.insert("1.0", text)
+        output.configure(state="disabled")
+        ttk.Button(frame, text="Close", command=window.destroy).grid(
+            row=1, column=0, columnspan=2, pady=(8, 0), sticky="e"
+        )
 
 
 def main():

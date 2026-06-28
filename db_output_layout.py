@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 
-GENERATED_DB_DIR = Path("generated_db")
+GENERATED_DB_DIR = Path("db")
 GRAPH_DB_DIR = GENERATED_DB_DIR / "graph"
 CANONICAL_DB_DIR = GENERATED_DB_DIR / "canonical"
 AGENT_DB_DIR = GENERATED_DB_DIR / "agents"
@@ -23,10 +23,13 @@ GRAPH_FILES = [
 
 CANONICAL_FILES = [
     "world_db.json",
+    "canonical_novel_db.json",
     "canonical_timeline_db.json",
     "canonical_event_db.json",
+    "canonical_scene_beat_db.json",
     "canonical_character_db.json",
     "canonical_relationship_db.json",
+    "canonical_relationships_db.json",
     "canonical_ability_db.json",
     "canonical_item_db.json",
     "canonical_organization_db.json",
@@ -37,6 +40,7 @@ CANONICAL_FILES = [
     "mention_alias_index.json",
     "canonical_entities.json",
     "character_state_db.json",
+    "simulation_state_db.json",
 ]
 
 AGENT_FILES = [
@@ -46,6 +50,7 @@ AGENT_FILES = [
 
 RUNTIME_FILES = [
     "simulation_state_template.json",
+    "simulation_state.json",
     "runtime_event_db.json",
     "runtime_relationship_db.json",
     "runtime_log.json",
@@ -95,3 +100,23 @@ def publish_generated_databases(base_dir=Path(".")):
             shutil.copy2(source, target)
             published[filename] = str(target)
     return published
+
+
+def cleanup_root_database_files(base_dir=Path("."), published=None):
+    """Remove root-level generated JSON files after they were copied to db/."""
+    base_dir = Path(base_dir)
+    published = published or publish_generated_databases(base_dir)
+    protected = {"settings.json"}
+    removed = []
+    for filename in sorted(
+        set(GRAPH_FILES + CANONICAL_FILES + AGENT_FILES + RUNTIME_FILES)
+    ):
+        if filename in protected:
+            continue
+        source = base_dir / filename
+        target = published.get(filename)
+        if not source.is_file() or not target or not Path(target).is_file():
+            continue
+        source.unlink()
+        removed.append(str(source))
+    return removed

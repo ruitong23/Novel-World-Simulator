@@ -20,6 +20,22 @@ IDENTITY_SIGNAL_TYPES = {
     "ADDRESSES_AS",
 }
 
+RESOLVER_CONTEXT_TYPES = {
+    "CO_OCCURS_IN_SCENE",
+}
+
+SHARED_CONTEXT_RELATION_TYPES = {
+    "CO_PARTICIPATES_IN_EVENT",
+    "CO_PRESENT_AT_LOCATION",
+    "SHARES_OR_TOUCHES_ARTIFACT_CONTEXT",
+}
+
+FINAL_CONTEXT_EVIDENCE_KINDS = {
+    "shared_event",
+    "shared_location",
+    "shared_artifact",
+}
+
 CHARACTER_RELATION_TYPES = {
     "HAS_RELATIONSHIP",
     "COMPANION_OF",
@@ -99,7 +115,7 @@ def edge_record(edge, nodes, weak_type=None, confidence=0.8, evidence_kind="expl
         "relationship_signal": (
             relation_type in CHARACTER_RELATION_TYPES
             or evidence_kind
-            in {"same_scene", "shared_event", "shared_location", "shared_artifact"}
+            in FINAL_CONTEXT_EVIDENCE_KINDS
         ),
         "confidence": confidence,
     }
@@ -122,7 +138,7 @@ def pair_record(left, right, weak_type, chunk_id, source_text, confidence, evide
         "source_edge_id": "",
         "evidence_kind": evidence_kind,
         "resolver_signal": False,
-        "relationship_signal": True,
+        "relationship_signal": weak_type not in RESOLVER_CONTEXT_TYPES,
         "confidence": confidence,
     }
     payload["weak_relation_id"] = "weak_" + stable_json_hash(payload)[:20]
@@ -418,7 +434,7 @@ def normalize_weak_relations(weak_db, canonical_entities):
             and (
                 relation["weak_relation_type"] in CHARACTER_RELATION_TYPES
                 or relation.get("evidence_kind")
-                in {"shared_event", "shared_location", "same_scene", "shared_artifact"}
+                in FINAL_CONTEXT_EVIDENCE_KINDS
             )
         ):
             record["final_relationship"] = True
@@ -431,7 +447,14 @@ def normalize_weak_relations(weak_db, canonical_entities):
         record["arc_strength"] = (
             "explicit"
             if record["relationship_type"] in CHARACTER_RELATION_TYPES
+            else "shared_context"
+            if record["relationship_type"] in SHARED_CONTEXT_RELATION_TYPES
             else "weak_context"
+        )
+        record["runtime_use"] = (
+            "relationship_seed"
+            if record["final_relationship"]
+            else "resolver_or_retrieval_context"
         )
         relationships.append(record)
     relationships.sort(
@@ -459,6 +482,7 @@ def normalize_weak_relations(weak_db, canonical_entities):
         "policy": {
             "canonical_after_resolution": True,
             "weak_context_is_not_identity_merge": True,
+            "same_scene_is_not_final_relationship": True,
             "agent_runtime_can_track_relationship_state": True,
         },
     }

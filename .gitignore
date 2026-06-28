@@ -9,8 +9,12 @@ env/
 
 settings.json
 
-generated_db/**/*.json
-!generated_db/**/.gitkeep
+db/**/*.json
+!db/**/.gitkeep
+db/agents/runtime_agent_dbs/**
+!db/agents/runtime_agent_dbs/.gitkeep
+sessions/
+users/
 
 *.bak
 smoke_*.json
